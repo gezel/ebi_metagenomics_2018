@@ -1,0 +1,560 @@
+---
+title: "Comparative metagenomics part I - exploration, visualization & testing"
+output:
+   BiocStyle::html_document:
+      toc: true
+      df_print: paged
+      self_contained: true
+      code_download: true
+      highlight: tango
+author: "Georg Zeller, Jakob Wirbel [EMBL Heidelberg]"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r style, echo=FALSE, results="asis", cache=FALSE}
+library("knitr")
+options(digits = 2, width = 80)
+golden_ratio <- (1 + sqrt(5)) / 2
+opts_chunk$set(echo = TRUE, tidy = FALSE, include = TRUE,
+               dev=c('png', 'pdf', 'svg'), fig.height = 5, 
+               fig.width = 4 * golden_ratio, comment = '  ', dpi = 300,
+cache = TRUE)
+```
+
+**LAST UPDATED**
+
+```{r, echo=FALSE, cache=FALSE}
+print(format(Sys.time(), "%b %d %Y"))
+```
+
+
+# Preparation of our R environment
+
+```{r setup, cache = FALSE, message=FALSE}
+# some technicalities to get started
+set.seed(2017) # to make steps depending on random numbers reproducible
+# we are going to use functions from the following packages
+library('vegan')
+library('FastKNN')
+library('coin')
+library('RColorBrewer')
+
+# to install them, use the following commands from within a Jupyter notebook
+#install.packages('vegan',        repos='http://cran.us.r-project.org')
+#install.packages('FastKNN',      repos='http://cran.us.r-project.org')
+#install.packages('coin',         repos='http://cran.us.r-project.org')
+#install.packages('RColorBrewer', repos='http://cran.us.r-project.org')
+```
+
+
+# Introduction
+
+Here we're going to explore some tools for comparing metagenomes. They are
+generic in the sense that they should work for both amplicon (16S rRNA gene,
+18S, ITS amplicons) and shotgun sequencing data. We will focus on taxonomic
+comparisons, but most techniques are also applicable to functional data (gene
+families or domains, KEGG, GO annotations etc.), but summarization at pathway
+level may pose some additional analysis challenges not discussed here.
+
+
+# Loading data
+
+We assume to be given a table of read counts which contains one taxon per row
+and one sample per column (instead of taxa you might have gene families,
+domains pathways etc.)
+
+```{r}
+# this is data published with H.B. Nielsen et al., Nat. Biotechnol. 2014
+#fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-UC-N100_tax-ab-specI.tsv'
+#fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-UC-N100_metadata.tsv'
+#fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-CD-N71_tax-ab-specI.tsv'
+#fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-CD-N71_metadata.tsv'
+
+# this is data from G. Zeller et al., Mol. Syst. Biol. 2014
+fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/FR-CRC-N141_tax-ab-specI.tsv'
+fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/FR-CRC-N141_metadata.tsv'
+
+# this is data from Feng et al., Gut 2015
+#fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/CN-CRC-N128_tax-ab-specI.tsv'
+#fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/CN-CRC-N128_metadata.tsv'
+
+# read abundance matrix
+ab <- read.table(fn.tax.profile, quote = '', sep = '\t', header = TRUE,
+                 row.names = 1, check.names = FALSE, 
+                 stringsAsFactors = FALSE)
+ab <- as.matrix(ab)
+
+# read additonal patient metadata
+meta <- read.table(fn.metadata, quote = '', sep = '\t', header = TRUE,
+                   row.names = 1, check.names = FALSE, 
+                   stringsAsFactors = FALSE)
+
+# assert correspondence between abundance and meta data
+stopifnot(all(rownames(meta) == colnames(ab)))
+cat('Loaded data: n =', ncol(ab), 'samples, p =', nrow(ab), 'taxa (species).\n')
+```
+
+We will also assume that there are two groups and we are interested in
+microbiome differences between these groups (as in a standard case-control
+study)
+
+```{r}
+GROUPS <- unique(meta$Group)
+stopifnot(length(GROUPS) == 2)
+#print(GROUPS)
+
+# resort according to groups for cleaner visualizations
+o <- order(meta$Group)
+meta <- meta[o,]
+ab <- ab[,o]
+```
+
+
+# Data preprocessing
+
+For some comparisons later on, data transformations such as conversion to
+relative abundances (also called total sum scaling) or rarefying helps to
+minimize technical bias due to differences in sequencing library size.
+More information on the effect of these transformations can be found in
+[McMurdie and Holmes, 2014](http://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1003531), 
+[Weiss et al., 2017](https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-017-0237-y)
+and [Costea et al., 2014](http://www.nature.com/nmeth/journal/v11/n4/full/nmeth.2897.html).
+
+Let's have a look at the variance in library size. 
+```{r}
+hist(colSums(ab), 20, col = '#0030A080', main = 'Histogram of library sizes')
+```
+
+
+One way of dealing with these differences, is to remove the most shallow
+outliers and use relative or rarefied abundances subsequently.
+```{r}
+# remove outlier samples with very few reads
+min.lib.size <- 50000
+cat(sum(colSums(floor(ab)) < min.lib.size), 'samples have <', min.lib.size, 'reads.\n')
+meta <- meta[colSums(floor(ab)) >= min.lib.size,]
+ab <- ab[,colSums(floor(ab)) >= min.lib.size]
+table(meta$Group)
+```
+
+```{r}
+# relative abundances
+rel.ab <- prop.table(ab, 2)
+# rarefied abundances
+rar.ab <- t(rrarefy(t(floor(ab)), min.lib.size))
+# need matrix transpose to match vegan's conventions about count matrix
+
+# remove taxa whose abundance is zero across all samples
+ab <- ab[rowSums(ab) > 0,]
+rel.ab <- rel.ab[rowSums(rel.ab) > 0,]
+rar.ab <- rar.ab[rowSums(rar.ab) > 0,]
+cat('Retained', nrow(ab), 'abundance features,', 
+                nrow(rel.ab), 'relative abundance features and', 
+                nrow(rar.ab), 'rarefied abundance features.\n')
+```
+
+
+# Community dissimilarity analysis
+
+In addition to commonly used distances (such as the Euclidean or L1/Manhattan
+distances), many dissimilarity measures have been proposed by ecologists to
+compare to habitat samples for differences in observed species content. The R
+vegan packages offers a large selection.
+
+```{r}
+# calculate pairwise dissimilarities using the vegan package
+diss.bray <- vegdist(t(rar.ab), method = 'bray') # transpose to match vegan's conventions
+diss.manhattan <- vegdist(t(rel.ab), method = 'manhattan')
+diss.euclid <- vegdist(t(rel.ab), method = 'euclidean')
+diss.logeuclid <- vegdist(t(log10(rel.ab + 1E-6)), method = 'euclidean')
+diss.canberra <- vegdist(t(rar.ab), method = 'canberra')
+diss.jaccard <- vegdist(t(rar.ab>0), method = 'jaccard')
+
+diss.list <- list(braycurtis   = as.matrix(diss.bray), 
+                  manhattan    = as.matrix(diss.manhattan), 
+                  euclidean    = as.matrix(diss.euclid),
+                  logeuclidean = as.matrix(diss.logeuclid),
+                  canberra     = as.matrix(diss.canberra),
+                  jaccard      = as.matrix(diss.jaccard))
+
+d <- 1
+image(as.matrix(diss.list[[d]]))
+```
+This gives an idea of sample-to-sample distances varying quite a bit, but
+overall better visualizations exist for this...
+
+## Visualization of a pairwise dissimilarity matrix by ordination
+
+Principal component analysis (PCA) is a commonly used exploratory data
+analysis tool that is very powerful at revealing structure in a data set. It
+"rotates" a high-dimensional data set into a coordinate system (orthogonal
+basis) of linearly uncorrelated principal components (by an orthogonal
+transformation) in such a way that the first principal component accounts for
+most of the variance; the second coordinate, orthogonal to the first one, for
+most of the remaining variance and so on. For the purpose of visual data
+exploration, one often plots a projection to the first two (or three)
+principal components - which, intuitively speaking, carry most of the
+information contained in a high-dimensional data set.
+
+Principal coordinate analysis (PCoA, also called multidemnsional scaling,
+MDS) can be seen as a more general ordination technique which aims to place
+samples in a lower dimensional space such that arbitrary, pre-specified
+distances between samples are preserved as well as possible; these distances
+can be provided by the user as an input to PCoA.
+
+We first compute the PCA projection...
+```{r}
+pcoa.proj <- cmdscale(diss.list[[6]], k = 2)
+colnames(pcoa.proj) <- c('PCo 1', 'PCo 2')
+```
+... and then visualize it.
+```{r}
+plot(pcoa.proj, pch = 16, col = ifelse(meta$Group==GROUPS[1], '#0030A080', '#A0003080'))
+legend('bottomleft', GROUPS, pch = 16, col = c('#0030A080', '#A0003080'), bty='n')
+```
+
+
+## Investigating separation between groups
+We can also more directly compare distances within and between groups, e.g.
+by box plots.
+```{r}
+within.idx <- matrix(FALSE, ncol(ab), ncol(ab))
+between.idx <- matrix(FALSE, ncol(ab), ncol(ab))
+for (i in 1:(ncol(ab)-1)) {
+    for (j in (i+1):ncol(ab)) {
+        if (meta$Group[i] == meta$Group[j]) {
+            within.idx[i,j] <- TRUE
+        } else {
+            between.idx[i,j] <- TRUE   
+        }
+    }
+}
+#image(within.idx)
+#image(between.idx)
+
+d <- 5
+boxplot(diss.list[[d]][within.idx], diss.list[[d]][between.idx],
+        main = paste(names(diss.list)[d], 'distance by group'), 
+        names = c('within', 'between'), ylab='Dissimilarity')
+```
+
+
+## Assessing separation using k-nearest neighbor classification
+
+To quantify whether samples from the same group cluster together, we can
+assess how often neighboring samples agree with respect to their group
+membership. This is the concept underlying the simple, yet powerful,
+k-nearest neighbor classifier implemented below.
+
+```{r}
+# k-nearest neighbor classifier
+k <- 5
+
+# we'll use the d-th distance from our list to determine nearest neighbors
+d <- 1
+
+nn <- matrix(0, nrow = ncol(ab), k)
+rownames(nn) <- colnames(ab)
+# agreement between group of neighbors and group of actual sample
+nn.agreement <- rep(NA, ncol(ab))
+names(nn.agreement) <- colnames(ab)
+for (i in 1:ncol(ab)) {
+    nn[i,] <- as.numeric(k.nearest.neighbors(i, diss.list[[d]], k = k))
+    nn.agreement[i] <- mean(meta$Group[nn[i,]] == meta$Group[i])
+}
+
+# Accuracy of kNN classifier
+cat('k-NN accuracy ', names(diss.list)[d], ': ', mean(nn.agreement > 0.5), '\n', sep='')
+```
+
+
+### Caveat
+Although as a researcher you hope to see larger dissimilarities between
+groups than within, it is not always possible to observe such a clear
+clustering of microbial abundance data. Even in cases where global
+dissimilarity does not reveal differences in community composition, not all
+is lost, as individual taxa may still show significant abundance changes
+between groups as we will see in the following.
+
+To understand the contribution of individual taxa - varying widely in their
+mean abundance - to global dissimilarity measures, we are visualizing a
+crucial difference between the L2 and L1 families of dissimilarity measures
+by summing up squared or absolute differences across taxa, respectively. 
+L1 based dissimilarities include Manhattan, Bray-Curtis and Canberra, whereas
+Euclidean and Correlation-based distances are from the L2 family.
+
+```{r}
+s1 <- 1
+s2 <- 2
+#ab.subset <- log10(rel.ab[,c(s1, s2)] + 1E-6)
+ab.subset <- rel.ab[,c(s1, s2)]
+# reorder taxa by decreasing mean abundance 
+# (and restrict to the top 100 taxa)
+ab.subset <- ab.subset[order(rowMeans(ab.subset), decreasing = TRUE)[1:100],]
+```
+
+Comparing L2 distances...
+```{r}
+barplot((ab.subset[,1] - ab.subset[,2])^2, 
+        names.arg = '', width = 1, space = 0, main='L2 distances')
+```
+
+... to L1 distances...
+```{r}
+barplot(abs(ab.subset[,1] - ab.subset[,2]), 
+        names.arg = '', width = 1, space = 0, main='L1 distances')
+```
+... shows that the L1 distances are influenced by more (less abundant) taxa
+-- recall that the taxa (x-axis) are in decreasing order of their abundance.
+
+
+# Testing individual features for association with groups
+To test individual taxa (or functional microbiome features) for association
+with external factors such as disease, I recommend using a nonparametric
+approach. To assess the differences between two groups, we can use the
+Wilcoxon test (also called Mann-Whitney U test); for more than two groups the
+Kruskal-Wallis test. To correct for multiple hypthesis testing, we will
+employ false discovery rate control [Benjamini & Hochberg, 1995](https://www.jstor.org/stable/2346101), 
+[Storey & Tibshirani, 2003](http://www.pnas.org/content/100/16/9440).
+
+A comparison of testing approaches can be found in [Weiss et al., 2017](https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-017-0237-y).
+LefSe [Segata et al., 2011](https://genomebiology.biomedcentral.com/articles/10.1186/gb-2011-12-6-r60)
+and [SIAMCAT](http://siamcat.embl.de/) offer neat visualizations of
+differentially abundant taxa identified by Wilcoxon tests.
+
+
+
+```{r}
+# we will only test taxa which reach an abundance of 1E-3 in at least on sample
+ab.cutoff <- 1E-3
+filt.rel.ab <- rel.ab[apply(rel.ab, 1, max) >= ab.cutoff,]
+#filt.rar.ab <- rar.ab[apply(rel.ab[rownames(rar.ab),], 1, max) >= ab.cutoff,]
+#filt.raw.ab <- ab[apply(rel.ab[rownames(ab),], 1, max) >= ab.cutoff,]
+filt.ab <- filt.rel.ab
+
+# we are going to test each taxon separately
+p.values <- rep(1, nrow(filt.ab))
+for (t in 1:nrow(filt.ab)) {
+  p.values[t] <- wilcox.test(filt.ab[t, meta$Group == GROUPS[1]], 
+                             filt.ab[t, meta$Group ==GROUPS[2]])$p.value
+}
+# afterwards we need to adjust for multiple hypothesis testing using the FDR
+p.values <- p.adjust(p.values, method = 'fdr')
+
+sign.idx <- which(p.values < 0.05)
+sign.idx <- sign.idx[order(p.values[sign.idx])]
+cat('Found', length(sign.idx), 'significantly associated taxa:\n')
+for (i in sign.idx) {
+    cat('  ', rownames(filt.ab)[i], ': ', format(p.values[i]), '\n', sep='')
+}
+```
+
+Using box plots we can try and get an idea how much these abundances differ between groups -- I highly recommend looking at this kind of data no matter which methods you're using to identify differentially abundant taxa.
+```{r}
+for (i in sign.idx) {
+    sign.taxon.df <- data.frame(filt.rel.ab = log10(filt.rel.ab[i,] + 1E-6), 
+                                groups = as.factor(meta$Group))
+    boxplot(filt.rel.ab ~ groups, data = sign.taxon.df,
+            ylab = 'Relative abundance (log10 scale)', 
+            main = rownames(filt.rel.ab)[i], cex.main = 0.8,
+            lwd = 2, names = as.character(levels(sign.taxon.df$groups)))
+    stripchart(filt.rel.ab ~ groups, data = sign.taxon.df,
+               method = "jitter", vertical = TRUE, 
+               add = TRUE, pch = 20, cex = 1.5, col = '#0030A080')
+}
+```
+
+### Caveat
+When there are very pronounced changes in community composition, the
+compositionality of the (relative) microbial abundance data may cause
+spurious associations, in particular if one or some of the most abundant taxa
+are altered in abundance.
+
+## Visualization of differential taxa as heatmap
+here we use R's basic image function, but heatmap.2 also offers very nice
+functionality.
+
+
+```{r}
+col.scheme <- colorRampPalette(brewer.pal(9,'YlGnBu'))(100)
+
+img.data <- t(log10(filt.rel.ab[sign.idx,] + 1E-6))
+
+# set figure dimensions
+par(mar = c(1,0,1,8))
+
+zlim <- c(-6, 0)
+
+image(img.data, xaxt = 'n', yaxt = 'n', xlab = '', ylab = '', bty = 'n',
+      zlim = zlim, col = col.scheme)
+
+for (t in 1:length(sign.idx)) {
+    mtext(rownames(filt.rel.ab)[sign.idx[t]], side = 4, line = 0.2, cex = 0.5, las = 2,
+          at = (t-1) / (length(sign.idx)-1))
+}
+
+for (s in 1:ncol(filt.rel.ab)) {
+    mtext(meta$Group[s], side = 1, line = 0.2, cex = 0.2, las = 2,
+          at = (s-1) / (ncol(filt.rel.ab)-1))
+}
+
+# set figure dimensions for color key
+par(mar = c(2,2,2,2))
+
+barplot(as.matrix(rep(1,100)), col = col.scheme, horiz = TRUE, border = 0, ylab = '', 
+        axes = FALSE)
+key.ticks <- seq(zlim[1], zlim[2], length.out=7)
+axis(side = 1, at = seq(0, 100, length.out=7), labels = 10^key.ticks, cex.axis = 0.7)
+mtext('Rel. ab (log-scale)', side = 3, line = 0.5, at = 50, cex = 0.7, adj = 0.5)
+
+par(mar = c(5,4,4,4))
+```
+
+
+# Correlation analysis
+To assess the correlation between microbial taxa and an external factor with continous values (in the below we will use host age as an example), Spearman's correlation coefficient is a good choice as it is robust to the complex distribution of microbiome abundance data; an alternative can be Pearson correlation on suitably transformed abundance data (e.g. log-transformed relative abundances).
+
+
+```{r}
+# correlate taxa with age
+corr.p.values <- rep(1, nrow(filt.rel.ab))
+
+for (t in 1:nrow(filt.rel.ab)) {
+  corr.p.values[t] <- cor.test(filt.rel.ab[t,], meta$Age, 
+                               method = 'spearman', exact=FALSE)$p.value}
+corr.p.values <- p.adjust(corr.p.values, method = 'fdr')
+sign.idx <- which(corr.p.values < 0.1)
+for (i in sign.idx) {
+  cat(rownames(filt.rel.ab)[i], ': ', format(corr.p.values[i]), '\n', sep='')
+  plot(meta$Age, log10(filt.rel.ab[i,] + 1E-6), pch = 16, col = 'blue',
+       main = rownames(filt.rel.ab)[i], cex.main = 0.8,
+       xlab = 'Host Age', ylab = 'Relative abundance (log10-scale)')
+  mtext(paste('rho =', format(cor(filt.rel.ab[i,], meta$Age,
+                                  method = 'spearman'), digits=3)))
+}
+```
+
+### Caveat
+Although the correlations above may be statistically significant, they are
+not necessarily robust, in particular when taxa are involved that are not
+detectable in most of the communities. The compositional nature of microbiome
+data can moreover cause spurious correlations, see 
+[Friedman & Alm](http://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1002687), 
+[Weiss et al., 2016](http://www.nature.com/ismej/journal/v10/n7/full/ismej2015235a.html).
+
+
+# Exercises
+## Task 1
+Explore basic characteristics of your data set using functions head, dim and
+table (e.g. table(meta$Group); assess distribution of library size (using
+hist) and find a suitable minimal library size for rarefying.
+
+**Optional:** Get a feeling for noise in the sampling process corresponding
+to the sequencing experiment, using a log-log plot of relative abundance of
+two (arbitrary) samples.
+
+## Task 2
+Visualize other dissimilarity matrices using the image function and visually
+explore whether samples cluster by group using PCoA.
+
+## Task 3
+Choose another dissimilarity measure from the vegan package and include it in
+the list (diss.list).
+
+## Task 4
+To better understand how variance differs between individual taxa, explore
+what statisticians call heteroscedasticity for microbiome data by plotting
+mean versus variance (use log-scale for both axes). Repeat this task for
+log-transformed relative abundances to assess whether this tranformation
+'stabilizes' the variance.
+
+### Solution
+```{r}
+par(mar = c(5,4,4,4))
+
+plot(log10(apply(rel.ab, 1, mean)), log10(apply(rel.ab, 1, var)),
+    pch = 16, col = '#0030A080', main = 'M-V plot of rel. ab.',
+    xlab = 'mean (log10-scale)', ylab = 'var (log10-scale)')
+
+plot(apply(log10(rel.ab+1E-6), 1, mean), apply(log10(rel.ab+1E-6), 1, var),
+    pch = 16, col = '#0030A080', main = 'M-V plot of logged rel. ab',
+    xlab = 'mean', ylab = 'var')
+```
+
+## Task 5
+Run kNN classification on the other dissimilarity measures and compare the
+results. Try to assess whether a particular one works best for the data
+you're looking at.
+
+**Optional:** Modify the kNN classifier to operate on the first two principal
+coordinates to assess separation in the ordination plot (hint: use Euclidean
+distance on the projection).
+
+## Task 6
+Explore the effect of log transformation on L1 and L2 distances by modifying
+the barplots to visualize (squared or absolute) differences between
+log-transformed relative abundances.
+
+## Task 7
+Explore how the result of statistical testing changes if abundance filtering
+is omitted. To understand the difference, it can be instructive to isolate
+the effect of multiple testing correction (p.adjust).
+
+## Task 8
+For a deeper understanding of whether nonparametric statistics should be
+preferred over parametric ones, it is instructive to visually explore
+microbial abundance features. Based on these empirical distributions, ask
+yourself whether the application of parametric methods, such as Student's
+T-test assuming Gaussian data, can be justified.
+
+**Hint:** Prevotella copri (the 32th species in the tables loaded above) is
+an interesting example; try plotting a histogram of 
+`log10(rel.ab[38,] + 1E-6)`
+
+**Optional:** Use the Shapiro Wilks goodness-of-fit test to assess whether
+microbial abundance data follows a Gaussian distribution (you can also apply
+it to log-transformed relative abundance, or zero-filtered log-trasnformed
+relative abundance)
+
+## Task 9
+Replace the data sets above by your own data (or any other data that is
+publicly available) and recapitulate the analyses on that.
+
+**Hint:** make sure you have metadata in an appropriate format with a column
+Group that is a two-level factor.
+
+## Task 10
+Explore the effects of different abundance preprocessing techniques (relative
+abundance versus rarefied counts, both with and without log transformation).
+
+###  Task 10a
+Try to combine two data sets to perform cross-study comparisons
+(meta-analysis). You can e.g. use cbind and rbind on tow of teh data sets
+above. Introduce an additonal column in the meta data frame that keeps track
+of the original study.
+
+### Task 10b
+Use PCoA to explore how strong batch and study (protocol) effects are
+relative to each other.
+
+### Task 10c
+Perform univariate Wilcoxon tests on the combined data set. To account for
+study effects as potential confounders, the coin package offers permutation
+based tests that allow for blocking (by study). You can substitute these in
+the code above and compare the results to a naive test on the combined data.
+
+**Hint:** the syntax is a bit different, the below should help
+```{r}
+#pvalue(wilcox_test(meta$Group ~ filt.rel.ab[t,] | as.factor(meta$Study)))
+```
+
+
+
+
+# Session information
+
+```{r cache=FALSE}
+sessionInfo()
+```
+

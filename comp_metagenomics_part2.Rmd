@@ -1,0 +1,278 @@
+---
+title: "Comparative metagenomics part II - statistical modeling"
+output:
+   BiocStyle::html_document:
+      toc: true
+      df_print: paged
+      self_contained: true
+      code_download: true
+      highlight: tango
+author: "Georg Zeller, Jakob Wirbel, Konrad Zych [EMBL Heidelberg]"
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r style, echo=FALSE, results="asis", cache=FALSE}
+library("knitr")
+options(digits = 2, width = 80)
+golden_ratio <- (1 + sqrt(5)) / 2
+opts_chunk$set(echo = TRUE, tidy = FALSE, include = TRUE,
+               dev=c('png', 'pdf', 'svg'), fig.height = 5, 
+               fig.width = 4 * golden_ratio, comment = '  ', dpi = 300,
+cache = TRUE)
+```
+
+**LAST UPDATED**
+
+```{r, echo=FALSE, cache=FALSE}
+print(format(Sys.time(), "%b %d %Y"))
+```
+
+
+# Preparation of our R environment
+
+```{r setup, cache = FALSE, message=FALSE}
+#source("https://bioconductor.org/biocLite.R")
+#biocLite('SIAMCAT')
+library('SIAMCAT')
+
+set.seed(123)
+```
+
+
+# Introduction
+
+This tutorial aims at illustrating how machine learning methods can be
+applied to associate gut microbiome composition with host 'phenotypes', using
+colorectal cancer as an example.
+
+For the analysis of gut microbiome associations with host states, statistical
+modeling (or machine learning) approaches nicely complement univariate tests
+for associations of single microbes with host state and multivariate
+ordination-based techniques, such as PCA and PCoA for the following reasons:
+
+- Trained models allow us to make predictions, the accuracy of which can be
+evaluated using ROC or precision-recall analysis; this is relevant for the
+development of microbiome-based diagnostic tests (e.g. for colorectal cancer
+screening). Often evaluations of accuracy are arguably more relevant measures
+of association strength than e.g. statistical significance.
+
+- Sparse (e.g. regularized) statistical models offer a good trade-off between
+multivariate and univariate testing, as they're not just based on a single
+feature, but can pick up subtle associations that may be obscured by other
+sources of variation in multivariate analyses (e.g. PCA). They are thus
+useful for biomarker discovery (and used as such in other domains as well,
+e.g. genomics).
+
+(A more empirical treatment is found in [Zeller et al. Mol Syst Biol.,
+2014](http://onlinelibrary.wiley.com/doi/10.15252/msb.20145645/abstract).)
+
+Here we will use the [SIAMCAT toolbox](http://siamcat.embl.de/) to implement
+a statistical modeling workflow with a [LASSO logistic regression
+classifier](https://www.jstor.org/stable/2346178) at its core.
+
+
+# Loading data and storing it in a SIAMCAT object
+
+First, we load the data. For this it's useful to note that SIAMCAT uses and
+extends the 
+[phyloseq](https://bioconductor.org/packages/release/bioc/html/phyloseq.html)
+data structures. The feature matrix (with e.g. species abundances) is stored
+in the `otu_table` slot of the underlying `phyloseq` object.
+and can be accessed via the phyloseq accessors.
+
+
+```{r}
+# this is data published with H.B. Nielsen et al., Nat. Biotechnol. 2014
+fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-UC-N100_tax-ab-specI.tsv'
+fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-UC-N100_metadata.tsv'
+#fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-CD-N71_tax-ab-specI.tsv'
+#fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/ES-CD-N71_metadata.tsv'
+
+# this is data from G. Zeller et al., Mol. Syst. Biol. 2014
+#fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/FR-CRC-N141_tax-ab-specI.tsv'
+#fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/FR-CRC-N141_metadata.tsv'
+
+# this is data from Feng et al., Gut 2015
+#fn.tax.profile <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/CN-CRC-N128_tax-ab-specI.tsv'
+#fn.metadata <- 'http://www.bork.embl.de/~zeller/public_metagenomics_data/CN-CRC-N128_metadata.tsv'
+
+
+# construct a feature matrix from the species abundance table
+feat <- read.table(file = fn.tax.profile, sep = "\t", header = TRUE, 
+                   stringsAsFactors = FALSE, check.names = FALSE, quote = "")
+feat <- as.matrix(feat)
+rownames(feat) <- make.names(rownames(feat))
+
+# convert the feature to a phyloseq otu_table object
+feat <- otu_table(feat, taxa_are_rows = TRUE)
+
+
+# read the metadata and store it phyloseq sample_data
+meta <- read.table(fn.metadata, quote='', sep='\t', header=TRUE,
+                   row.names=1, check.names=FALSE)
+head(meta)
+table(meta$Group)
+
+# convert the metadata to a numeric representation
+meta$Gender = ifelse(meta$Gender=='F', 1, 2)
+if ('FOBT' %in% colnames(meta)) {
+  meta$FOBT = ifelse(meta$FOBT=='Negative', -1, 1)
+}
+meta <- sample_data(meta)
+
+# construct a label vector from the group column of the meta data
+label <- create.label.from.metadata(meta, 'Group')
+
+# remove information redundant with the label from the metadata
+meta$Group <- NULL
+
+# combine all the phyloseq objects into a siamcat object
+siamcat <- siamcat(feat, label, meta)
+```
+
+We can access the feature, label and metadata in `siamcat/phyloseq`'s slots.
+The feature matrix for instance is stored in the `otu_table` slot and can be
+accessed via the `phyloseq` accessors.
+
+```{r}
+phyloseq <- physeq(siamcat)
+show(phyloseq)
+
+otu_table(phyloseq)[1:10, 1:2]
+colSums(otu_table(phyloseq))[1:10]
+```
+The last output tells us that we've stored raw counts. We will later convert these into relative abundances.
+
+Finally we call SIAMCAT's `validate.data` function to make sure all data is consistent and in a format that SIAMCAT understands.
+
+```{r}
+siamcat <- validate.data(siamcat)
+```
+
+# Data preparation and association testing using SIAMCAT
+
+
+## Low abundance filtering
+
+As a very commonly applied preprocessing routine, SIAMCAT offers
+functionality to discard feature with very low abundance in all samples.
+Most of these are heuristics motivated by the common believe that low
+abundance microbes are unlikely to play a major role in the gut ecosystem
+(e.g. as they could be transient bacteria taken up and passing through the
+intestine with food rather than colonizing the gut envirnment) and their
+quantification by metagenomic sequencing has the greatest uncertainty.
+
+Due to the `recomp.prop = TRUE` argument, the feature matrix will first be transformed into relative abundances. We will also remove the (fraction of) unmapped reads for all subsequent analyses.
+
+```{r}
+siamcat <- filter.features(
+    siamcat,
+    filter.method = 'abundance',
+    cutoff = 0.001,
+    recomp.prop = TRUE, 
+    rm.unmapped = TRUE
+    )
+
+phyloseq <- physeq(siamcat)
+show(phyloseq)
+```
+Instead of checking afterwards, what has happened, you could have used an
+additional argument `verbose = 2` in the `filter.features` function to see
+immediately what's going on.
+
+
+## Running univariate statistical tests from SIAMCAT
+Using SIAMCAT's `check.associations` function we can lazily get results from the Kruskal-Wallis test, corrected form multiple testing with a pedf display of the results...
+
+```{r}
+check.associations(
+    siamcat,
+    fn.plot = 'univ_associations.pdf',
+    alpha = 0.05,
+    plot.type = "quantile.rect",
+    verbose=0
+    )
+
+```
+
+
+# Model building
+This consists of three steps
+1. normalizing the features to best meet the assumptions of the subsequent modeling
+2. partitioning the data for cross validation
+3. fitting models on the training sets
+
+
+## Normalization
+
+SIAMCAT offers a few normalization approaches that can be useful for
+subsequent statistical modeling in the sense that they transform features in
+a way that can increase the accuracy of the resulting models. Importantly,
+these normalization techniques do not make use of any label information
+(patient status), and can thus be applied up front to the whole data set 
+(and outside of the following cross validation).
+
+```{r}
+siamcat <- normalize.features(
+    siamcat,
+    norm.method = "log.std",
+    verbose = 2
+)
+```
+
+
+## Splitting the data and training the model (on the training set)
+Here we use ten-fold cross validation without resampling and train [LASSO logistic regression classifiers](https://www.jstor.org/stable/2346178).
+
+```{r}
+siamcat <- create.data.split(
+    siamcat,
+    num.folds = 10,
+    num.resample = 2,
+    verbose = 2
+)
+
+siamcat <- train.model(
+    siamcat,
+    method = 'lasso',
+    verbose = 3
+)
+```
+
+
+## Applying the model to predict on the test set
+This will automatically apply the models trained in cross validation to their
+respective test sets and aggregate the predictions across the whole data set.
+```{r}
+siamcat <- make.predictions(siamcat, verbose=0)
+```
+
+
+## Model evaluation and interpretation
+Calling the `evaluate.predictions` funtion will result in an assessment of
+precision and recall as well as in ROC analysis, both of which can be plotted
+as a pdf file using the `model.evaluation.plot` funtion (the name of/path to
+the pdf file is passed as an argument).
+
+```{r}
+siamcat <- evaluate.predictions(siamcat, verbose=2)
+model.evaluation.plot(siamcat, fn.plot = 'model_evalulation.pdf',
+                      verbose = 2)
+```
+
+Finally, the `model.interpretation.plot` function will plot characteristics of the models (i.e. model coefficients or feature importance) alongside the input data aiding in understanding how / why the model works (or not).
+```{r}
+model.interpretation.plot(siamcat, fn.plot = 'model_interpretation.pdf',
+    heatmap.type = 'zscore', verbose = 2)
+
+```
+
+
+
+# Session information
+
+```{r cache=FALSE}
+sessionInfo()
+```
+
